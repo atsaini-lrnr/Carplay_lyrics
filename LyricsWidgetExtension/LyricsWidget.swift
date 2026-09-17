@@ -9,6 +9,7 @@
 import WidgetKit
 import SwiftUI
 import ActivityKit
+import UIKit
 
 public struct LyricsWidget: Widget {
     public init() {}
@@ -37,69 +38,31 @@ public struct LyricsWidget: Widget {
                     CarPlayLyricsCardView(state: context.state)
                 }
             } compactLeading: {
-                // Left Column (Right-aligned, meets right column at center)
-                let (cur1, _) = splitHalf(context.state.currentLine)
-                let (nxt1, _) = splitHalf(context.state.nextLine ?? "")
-                
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(cur1.isEmpty ? "Waiting..." : cur1)
-                        .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.65)
-                        .multilineTextAlignment(.trailing)
-                    
-                    if !nxt1.isEmpty {
-                        Text(nxt1)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.60))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.65)
-                            .multilineTextAlignment(.trailing)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                // Left Column: Entire Current Singing Lyric (Left-aligned, Bold White, up to 2 lines)
+                Text(context.state.currentLine.isEmpty ? "Waiting for lyrics..." : context.state.currentLine)
+                    .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.65)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } compactTrailing: {
-                // Right Column (Left-aligned, continues seamlessly from left column)
-                let (_, cur2) = splitHalf(context.state.currentLine)
-                let (_, nxt2) = splitHalf(context.state.nextLine ?? "")
-                
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(cur2)
-                        .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
+                // Right Column: Entire Upcoming Next Lyric (Left-aligned, Dimmed Gray, up to 2 lines)
+                if let next = context.state.nextLine, !next.isEmpty {
+                    Text(next)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.60))
+                        .lineLimit(2)
                         .minimumScaleFactor(0.65)
                         .multilineTextAlignment(.leading)
-                    
-                    if !nxt2.isEmpty {
-                        Text(nxt2)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.60))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.65)
-                            .multilineTextAlignment(.leading)
-                    }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             } minimal: {
                 Image(systemName: "music.note")
                     .foregroundColor(.white)
             }
         }
     }
-}
-
-// MARK: - Word Splitter Helper
-private func splitHalf(_ text: String) -> (String, String) {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return ("", "") }
-    let words = trimmed.split(separator: " ").map(String.init)
-    guard words.count > 1 else { return (trimmed, "") }
-    let mid = (words.count + 1) / 2
-    let first = words[0..<mid].joined(separator: " ")
-    let second = words[mid...].joined(separator: " ")
-    return (first, second)
 }
 
 // MARK: - CarPlay Dashboard & iPhone Lock Screen Presentation (Full 100% Width)
