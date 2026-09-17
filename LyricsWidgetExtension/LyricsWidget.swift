@@ -37,9 +37,25 @@ public struct LyricsWidget: Widget {
                     CarPlayLyricsCardView(state: context.state)
                 }
             } compactLeading: {
-                CarPlayLyricsCardView(state: context.state)
+                // Left Column: Active Singing Lyric (White Bold, up to 2 lines, auto-scaling)
+                Text(context.state.currentLine.isEmpty ? "Waiting for lyrics..." : context.state.currentLine)
+                    .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.65)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } compactTrailing: {
-                EmptyView()
+                // Right Column: Upcoming Lyric (Dimmed Gray, up to 2 lines, auto-scaling)
+                if let next = context.state.nextLine, !next.isEmpty {
+                    Text(next)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.60))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.65)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             } minimal: {
                 Image(systemName: "music.note")
                     .foregroundColor(.white)
