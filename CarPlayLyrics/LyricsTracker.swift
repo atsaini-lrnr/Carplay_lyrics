@@ -156,6 +156,35 @@ public final class LyricsTracker: ObservableObject {
             name: .MPMusicPlayerControllerPlaybackStateDidChange,
             object: musicPlayer
         )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+    
+    @objc private func handleDidEnterBackground() {
+        guard !isDemoMode else { return }
+        SilentAudioPlayer.shared.start()
+        if pollingTimer == nil {
+            startPolling()
+        }
+        print("[LyricsTracker] App entered background - silent keep-alive active.")
+    }
+    
+    @objc private func handleDidBecomeActive() {
+        guard !isDemoMode else { return }
+        SilentAudioPlayer.shared.start()
+        updateNowPlayingItem()
     }
     
     @objc private func handleNowPlayingChange() {
