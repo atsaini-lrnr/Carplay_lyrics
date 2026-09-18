@@ -123,6 +123,8 @@ public final class LyricsTracker: ObservableObject {
     }
     
     public func stopTracking() {
+        dispatchTimer?.cancel()
+        dispatchTimer = nil
         pollingTimer?.invalidate()
         pollingTimer = nil
         musicPlayer.endGeneratingPlaybackNotifications()
@@ -420,21 +422,38 @@ public final class LyricsTracker: ObservableObject {
         return result.sorted { $0.timestamp < $1.timestamp }
     }
     
-    // MARK: - Synchronization Engine (Delay Slider Logic)
+    private var dispatchTimer: DispatchSourceTimer?
+    
+    // MARK: - Synchronization Engine (Delay Slider Logic & Background Song Detection)
     
     private func startPolling() {
+        dispatchTimer?.cancel()
+        dispatchTimer = nil
         pollingTimer?.invalidate()
-        // Poll every 0.35 seconds on .common RunLoop mode
-        pollingTimer = Timer(timeInterval: 0.35, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, !self.isDemoMode else { return }
-                self.currentPlaybackTime = self.musicPlayer.currentPlaybackTime
-                self.syncCurrentTime(playbackTime: self.currentPlaybackTime)
+        pollingTimer = nil
+        
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(300), leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in
+            guard let self = self, !self.isDemoMode else { return }
+            
+            // CRITICAL: iOS stops delivering MPMusicPlayerControllerNowPlayingItemDidChange in background.
+            // Actively detect song change during background polling:
+            if let item = self.musicPlayer.nowPlayingItem {
+                let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let artist = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !title.isEmpty && (title != self.currentTitle || artist != self.currentArtist) {
+                    print("[LyricsTracker] Background song change detected: '\(title)' by '\(artist)'")
+                    self.updateNowPlayingItem()
+                    return
+                }
             }
+            
+            self.currentPlaybackTime = self.musicPlayer.currentPlaybackTime
+            self.syncCurrentTime(playbackTime: self.currentPlaybackTime)
         }
-        if let timer = pollingTimer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
+        timer.resume()
+        self.dispatchTimer = timer
     }
     
     /// Evaluates effective time: (currentPlaybackTime - userDelay) and updates lines
