@@ -54,8 +54,9 @@ final class LyricsTracker: ObservableObject {
     }
 
     private static let delayKey = "CarPlayLyrics_userDelay"
-    /// Stop the keep-alive after this long with nothing playing, so the phone doesn't drain in a pocket.
-    private static let idleTimeout: TimeInterval = 20 * 60
+    /// With nothing playing for this long, stop everything and remove the card (and its Dynamic
+    /// Island / location icons). Long enough to survive a pause or a short call.
+    private static let idleTimeout: TimeInterval = 3 * 60
 
     private let player = MPMusicPlayerController.systemMusicPlayer
     private let activity = LiveActivityController()
@@ -212,10 +213,10 @@ final class LyricsTracker: ObservableObject {
         scheduleTimer(fast: false)
 
         if Date().timeIntervalSince(since) > Self.idleTimeout {
+            // Not a user Stop: opening the app again starts a fresh card automatically.
             pauseTracking()
-            publish(LyricsAttributes.ContentState(kind: .status, currentLine: "Paused",
-                                                  nextLine: "Open CarPlayLyrics to resume",
-                                                  songTitle: title, artistName: artist))
+            Task { await activity.end() }
+            DiagnosticsLog.shared.add("No music for \(Int(Self.idleTimeout / 60)) min: stopped and removed the card")
         }
     }
 

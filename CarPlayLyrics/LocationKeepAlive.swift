@@ -5,7 +5,8 @@
 //  Second keep-alive, alongside SilentAudioPlayer. iOS keeps an app running while it receives
 //  background location updates (this is how navigation apps stay alive), so lyrics keep moving
 //  even if the silent-audio trick gets suspended. Low accuracy (cell/Wi-Fi), so it's cheap.
-//  Shows the blue location indicator while active. Personal-use technique.
+//  With "While Using" permission iOS shows a blue location arrow while it runs; with "Always"
+//  permission the arrow is hidden. Personal-use technique.
 //
 
 import CoreLocation
@@ -18,8 +19,7 @@ final class LocationKeepAlive: NSObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
     private var backgroundSession: CLBackgroundActivitySession?
     private var isWanted = false
-
-    var isRunning: Bool { backgroundSession != nil }
+    private(set) var isRunning = false
 
     private override init() {
         super.init()
@@ -44,17 +44,30 @@ final class LocationKeepAlive: NSObject, CLLocationManagerDelegate {
 
     func stop() {
         isWanted = false
+        isRunning = false
         manager.stopUpdatingLocation()
         backgroundSession?.invalidate()
         backgroundSession = nil
     }
 
     private func begin() {
-        guard isWanted, backgroundSession == nil else { return }
-        backgroundSession = CLBackgroundActivitySession()
+        guard isWanted else { return }
+        let isAlways = manager.authorizationStatus == .authorizedAlways
+
+        // "While Using" needs a background activity session (which shows the blue arrow);
+        // "Always" doesn't, and only "Always" apps may hide the arrow.
+        if isAlways {
+            backgroundSession?.invalidate()
+            backgroundSession = nil
+        } else if backgroundSession == nil {
+            backgroundSession = CLBackgroundActivitySession()
+        }
+        manager.showsBackgroundLocationIndicator = !isAlways
+
+        guard !isRunning else { return }
         manager.allowsBackgroundLocationUpdates = true
-        manager.showsBackgroundLocationIndicator = true
         manager.startUpdatingLocation()
+        isRunning = true
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -64,6 +77,8 @@ final class LocationKeepAlive: NSObject, CLLocationManagerDelegate {
             if status == .authorizedWhenInUse || status == .authorizedAlways {
                 keepAlive.begin()
             } else if status == .denied || status == .restricted {
+                keepAlive.stop()
+                keepAlive.isWanted = true  // resume if access is granted again later
                 DiagnosticsLog.shared.add("Location keep-alive off: location access denied")
             }
         }

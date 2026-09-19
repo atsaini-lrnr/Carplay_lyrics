@@ -30,13 +30,15 @@ final class SilentAudioPlayer {
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification,
                                             object: session, queue: .main) { note in
             let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let reasonRaw = note.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
             MainActor.assumeIsolated {
+                let reason = Self.describe(reasonRaw)
                 // Silent audio never needs to wait for permission to resume.
                 if raw == AVAudioSession.InterruptionType.ended.rawValue {
-                    DiagnosticsLog.shared.add("Audio interruption ended (call/Siri)")
+                    DiagnosticsLog.shared.add("Audio interruption ended (\(reason))")
                     SilentAudioPlayer.shared.resumeIfNeeded()
                 } else {
-                    DiagnosticsLog.shared.add("Audio interruption began (call/Siri)")
+                    DiagnosticsLog.shared.add("Audio interruption began (\(reason))")
                 }
             }
         })
@@ -85,6 +87,19 @@ final class SilentAudioPlayer {
         } catch {
             print("[SilentAudioPlayer] Could not start keep-alive: \(error)")
             DiagnosticsLog.shared.add("Audio keep-alive failed: \(error.localizedDescription)")
+        }
+    }
+
+    private static func describe(_ reasonRaw: UInt?) -> String {
+        guard let reasonRaw, let reason = AVAudioSession.InterruptionReason(rawValue: reasonRaw) else {
+            return "call, Siri or other audio"
+        }
+        switch reason {
+        case .appWasSuspended: return "app was suspended"
+        case .builtInMicMuted: return "mic muted"
+        case .routeDisconnected: return "audio route disconnected"
+        case .default: return "call, Siri or other audio"
+        @unknown default: return "reason \(reasonRaw)"
         }
     }
 
