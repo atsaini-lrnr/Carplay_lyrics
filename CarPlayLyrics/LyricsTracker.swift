@@ -2,642 +2,423 @@
 //  LyricsTracker.swift
 //  CarPlayLyrics
 //
-//  Production-ready music tracking, LRCLIB lyrics fetching, LRC parsing,
-//  audio delay calibration, and ActivityKit Live Activity synchronization.
+//  Follows Apple Music playback, fetches synced lyrics from LRCLIB, and keeps the Live Activity
+//  showing the current and next line.
 //
 
-import Foundation
-import MediaPlayer
 import ActivityKit
 import Combine
-import SwiftUI
+import Foundation
+import MediaPlayer
+import UIKit
 
-// MARK: - Parsed Lyric Model
-public struct LyricLine: Identifiable, Equatable {
-    public let id = UUID()
-    public let timestamp: TimeInterval
-    public let text: String
-    
-    public init(timestamp: TimeInterval, text: String) {
-        self.timestamp = timestamp
-        self.text = text
-    }
+struct LyricLine: Equatable {
+    let time: TimeInterval
+    /// Empty text marks an instrumental gap.
+    let text: String
 }
 
-// MARK: - LRCLIB API Response Models
-public struct LRCLibResponse: Decodable {
-    public let id: Int?
-    public let name: String?
-    public let trackName: String?
-    public let artistName: String?
-    public let albumName: String?
-    public let duration: Double?
-    public let instrumental: Bool?
-    public let plainLyrics: String?
-    public let syncedLyrics: String?
+/// Playback state at one instant, from Apple Music or from demo mode.
+private struct PlaybackSnapshot {
+    let trackKey: String
+    let title: String
+    let artist: String
+    let album: String
+    let duration: TimeInterval
+    let time: TimeInterval
+    let isPlaying: Bool
 }
 
-// MARK: - Lyrics Tracker
 @MainActor
-public final class LyricsTracker: ObservableObject {
-    public static let shared = LyricsTracker()
-    
-    // MARK: - Published Properties for UI
-    @Published public var currentTitle: String = "No Track Playing"
-    @Published public var currentArtist: String = "Waiting for music..."
-    @Published public var currentAlbum: String = ""
-    @Published public var currentPlaybackTime: TimeInterval = 0.0
-    @Published public var trackDuration: TimeInterval = 0.0
-    @Published public var isPlaying: Bool = false
-    
-    @Published public var currentLine: String = ""
-    @Published public var nextLine: String? = nil
-    @Published public var isSyncedAvailable: Bool = false
-    @Published public var statusMessage: String? = nil
-    
-    @Published public var isActivityActive: Bool = false
-    @Published public var isLiveActivitySupported: Bool = true
-    @Published public var isDemoMode: Bool = false
-    
-    // MARK: - Audio Delay Calibration (Persisted)
-    /// User calibration offset in seconds (Bluetooth/CarPlay wireless delay compensation).
-    /// Typically 0.5s to 1.5s in vehicle head units.
-    @Published public var userDelay: Double {
+final class LyricsTracker: ObservableObject {
+    static let shared = LyricsTracker()
+
+    /// What the Live Activity (and the in-app preview) currently shows.
+    @Published private(set) var card = LyricsAttributes.ContentState.waiting
+    @Published private(set) var isActivityActive = false
+    @Published private(set) var liveActivitiesEnabled = true
+    @Published private(set) var isTracking = false
+    @Published private(set) var isDemoMode = false
+    @Published private(set) var mediaAccessDenied = false
+
+    /// Bluetooth / wireless CarPlay audio lag compensation, in seconds.
+    @Published var userDelay: Double {
         didSet {
-            UserDefaults.standard.set(userDelay, forKey: "CarPlayLyrics_userDelay")
-            // Re-evaluate immediately when slider changes
-            syncCurrentTime(playbackTime: currentPlaybackTime)
+            UserDefaults.standard.set(userDelay, forKey: Self.delayKey)
+            tick()
         }
     }
-    
-    // MARK: - Private State
-    private let musicPlayer = MPMusicPlayerController.systemMusicPlayer
-    private var parsedLines: [LyricLine] = []
-    private var currentActivity: Activity<LyricsAttributes>?
-    private var pollingTimer: Timer?
-    private var currentFetchTask: Task<Void, Never>?
-    private var lyricsCache: [String: LRCLibResponse] = [:]
-    
-    // Demo mode timer
-    private var demoTimer: Timer?
-    
-    // MARK: - Initialization
-    public init() {
-        let savedDelay = UserDefaults.standard.double(forKey: "CarPlayLyrics_userDelay")
-        // Default to 0.8s if unset (standard Bluetooth A2DP buffer latency)
-        self.userDelay = UserDefaults.standard.object(forKey: "CarPlayLyrics_userDelay") != nil ? savedDelay : 0.8
-        
-        checkActivityKitSupport()
-        setupNotificationObservers()
+
+    private enum LyricsState: Equatable {
+        case none, loading, synced, unsynced, instrumental, notFound
     }
-    
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-        pollingTimer?.invalidate()
-        demoTimer?.invalidate()
-    }
-    
-    // MARK: - Setup & Permissions
-    
-    public func requestMediaPermission() {
-        MPMediaLibrary.requestAuthorization { [weak self] status in
-            Task { @MainActor in
-                if status == .authorized {
-                    self?.startTracking()
-                } else {
-                    self?.statusMessage = "Media library permission denied"
-                }
+
+    private static let delayKey = "CarPlayLyrics_userDelay"
+    /// Stop the keep-alive after this long with nothing playing, so the phone doesn't drain in a pocket.
+    private static let idleTimeout: TimeInterval = 20 * 60
+
+    private let player = MPMusicPlayerController.systemMusicPlayer
+    private let activity = LiveActivityController()
+    private let lrclib = LRCLibClient()
+
+    private var timer: DispatchSourceTimer?
+    private var timerIsFast = false
+    private var trackKey: String?
+    private var title = ""
+    private var artist = ""
+    private var lines: [LyricLine] = []
+    private var lyricsState = LyricsState.none
+    private var fetchTask: Task<Void, Never>?
+    private var notPlayingSince: Date?
+    private var demoStart = Date()
+    /// Set by the Stop button so returning to the app doesn't silently restart the card.
+    private var stoppedByUser = false
+    private var lastTickAt: Date?
+    /// What was going on at the last tick, for describing freezes.
+    private var lastTickContext = ""
+    private var lastHeartbeatAt = Date.distantPast
+
+    private init() {
+        userDelay = UserDefaults.standard.object(forKey: Self.delayKey) as? Double ?? 0.8
+        activity.onActiveChange = { [weak self] active in self?.isActivityActive = active }
+
+        let center = NotificationCenter.default
+        for name in [Notification.Name.MPMusicPlayerControllerNowPlayingItemDidChange,
+                     .MPMusicPlayerControllerPlaybackStateDidChange] {
+            center.addObserver(forName: name, object: player, queue: .main) { _ in
+                MainActor.assumeIsolated { LyricsTracker.shared.tick() }
             }
         }
+        center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { LyricsTracker.shared.start() }
+        }
+
+        if ProcessInfo.processInfo.arguments.contains("-demo") {
+            isDemoMode = true
+        }
     }
-    
-    public func startTracking() {
-        guard !isDemoMode else { return }
-        
-        // Start background silent audio to prevent suspension on lock screen
+
+    // MARK: - Start / Stop
+
+    /// Starts following playback and starts the Live Activity. Must run while the app is on screen,
+    /// because iOS only allows starting a Live Activity from the foreground.
+    /// `userInitiated` is true for the Start button; automatic starts (launch, returning to the app)
+    /// respect an earlier Stop.
+    func start(userInitiated: Bool = false) {
+        if userInitiated { stoppedByUser = false }
+        guard !stoppedByUser else { return }
+        liveActivitiesEnabled = ActivityAuthorizationInfo().areActivitiesEnabled
+
+        guard isDemoMode || MPMediaLibrary.authorizationStatus() == .authorized else {
+            MPMediaLibrary.requestAuthorization { status in
+                Task { @MainActor in
+                    let tracker = LyricsTracker.shared
+                    tracker.mediaAccessDenied = status != .authorized
+                    if status == .authorized { tracker.start() }
+                }
+            }
+            return
+        }
+        mediaAccessDenied = false
+
+        if !isTracking && !isDemoMode { player.beginGeneratingPlaybackNotifications() }
         SilentAudioPlayer.shared.start()
-        
-        musicPlayer.beginGeneratingPlaybackNotifications()
-        updateNowPlayingItem()
-        startPolling()
+        LocationKeepAlive.shared.start()
+        isTracking = true
+        notPlayingSince = nil
+        tick()
+        activity.startIfNeeded(with: card)
+        scheduleTimer(fast: true)
     }
-    
-    public func stopTracking() {
-        dispatchTimer?.cancel()
-        dispatchTimer = nil
-        pollingTimer?.invalidate()
-        pollingTimer = nil
-        musicPlayer.endGeneratingPlaybackNotifications()
+
+    /// Stops everything and removes the card (the "Stop" button).
+    func stop() {
+        stoppedByUser = true
+        pauseTracking()
+        Task { await activity.end() }
+    }
+
+    func setDemoMode(_ enabled: Bool) {
+        guard enabled != isDemoMode else { return }
+        pauseTracking()
+        isDemoMode = enabled
+        demoStart = Date()
+        resetTrack()
+        start(userInitiated: true)
+    }
+
+    private func pauseTracking() {
+        if isTracking && !isDemoMode { player.endGeneratingPlaybackNotifications() }
+        timer?.cancel()
+        timer = nil
+        lastTickAt = nil
+        fetchTask?.cancel()
         SilentAudioPlayer.shared.stop()
-        Task {
-            await endCurrentActivity()
-        }
+        LocationKeepAlive.shared.stop()
+        isTracking = false
     }
-    
-    private func checkActivityKitSupport() {
-        if #available(iOS 16.1, *) {
-            isLiveActivitySupported = ActivityAuthorizationInfo().areActivitiesEnabled
+
+    // MARK: - Tick (every 0.25 s while playing, 1 s while paused)
+
+    private func tick() {
+        guard isTracking else { return }
+        recordStallIfAny()
+        SilentAudioPlayer.shared.resumeIfNeeded()
+        activity.refreshIfOld()
+
+        guard let snapshot = currentSnapshot() else {
+            if trackKey != nil { resetTrack() }
+            publish(.waiting)
+            handleNotPlaying()
+            return
+        }
+
+        if snapshot.trackKey != trackKey {
+            load(snapshot)
+        }
+
+        if snapshot.isPlaying {
+            notPlayingSince = nil
+            scheduleTimer(fast: true)
         } else {
-            isLiveActivitySupported = false
+            handleNotPlaying()
+        }
+        guard isTracking else { return }
+
+        publish(makeCard(at: snapshot.time))
+        heartbeat(snapshot)
+    }
+
+    /// Every 5 s, prints what the app sees (visible with `devicectl ... --console`).
+    private func heartbeat(_ snapshot: PlaybackSnapshot) {
+        guard Date().timeIntervalSince(lastHeartbeatAt) >= 5 else { return }
+        lastHeartbeatAt = Date()
+        print("[heartbeat] \(Self.appStateDescription) | playing=\(snapshot.isPlaying) "
+              + "time=\(String(format: "%.1f", snapshot.time)) | \(snapshot.title) | line=\(card.currentLine)")
+    }
+
+    private static var appStateDescription: String {
+        let app = UIApplication.shared
+        switch app.applicationState {
+        case .active: return "app open"
+        case .inactive: return "app inactive"
+        default: return app.isProtectedDataAvailable ? "background" : "locked"
         }
     }
-    
-    // MARK: - Media Notifications (Steering wheel controls, skips, seeks)
-    
-    private func setupNotificationObservers() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleNowPlayingChange),
-            name: .MPMusicPlayerControllerNowPlayingItemDidChange,
-            object: musicPlayer
+
+    private func handleNotPlaying() {
+        let since = notPlayingSince ?? Date()
+        notPlayingSince = since
+        scheduleTimer(fast: false)
+
+        if Date().timeIntervalSince(since) > Self.idleTimeout {
+            pauseTracking()
+            publish(LyricsAttributes.ContentState(kind: .status, currentLine: "Paused",
+                                                  nextLine: "Open CarPlayLyrics to resume",
+                                                  songTitle: title, artistName: artist))
+        }
+    }
+
+    /// Ticks run at least every second while tracking; a longer gap means iOS suspended the app.
+    private func recordStallIfAny() {
+        let now = Date()
+        let context = "\(Self.appStateDescription), audio keep-alive \(SilentAudioPlayer.shared.isPlaying ? "on" : "OFF"), "
+            + "location keep-alive \(LocationKeepAlive.shared.isRunning ? "on" : "OFF")"
+        defer {
+            lastTickAt = now
+            lastTickContext = context
+        }
+        guard let last = lastTickAt, now.timeIntervalSince(last) > 5 else { return }
+
+        let start = last.formatted(date: .omitted, time: .standard)
+        DiagnosticsLog.shared.add("FROZE \(Int(now.timeIntervalSince(last))) s from \(start). Before: \(lastTickContext). "
+                                  + "Woke up: \(Self.appStateDescription)")
+    }
+
+    private func scheduleTimer(fast: Bool) {
+        guard timer == nil || fast != timerIsFast else { return }
+        timer?.cancel()
+        timerIsFast = fast
+
+        let newTimer = DispatchSource.makeTimerSource(queue: .main)
+        let interval: DispatchTimeInterval = fast ? .milliseconds(250) : .seconds(1)
+        newTimer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(50))
+        newTimer.setEventHandler {
+            MainActor.assumeIsolated { LyricsTracker.shared.tick() }
+        }
+        newTimer.resume()
+        timer = newTimer
+    }
+
+    private func publish(_ newCard: LyricsAttributes.ContentState) {
+        guard newCard != card else { return }
+        card = newCard
+        activity.update(newCard)
+    }
+
+    // MARK: - Playback Source
+
+    private func currentSnapshot() -> PlaybackSnapshot? {
+        if isDemoMode {
+            let loop = DemoLyrics.duration
+            return PlaybackSnapshot(trackKey: "demo", title: "Layout Demo", artist: "CarPlayLyrics",
+                                    album: "", duration: loop,
+                                    time: Date().timeIntervalSince(demoStart).truncatingRemainder(dividingBy: loop),
+                                    isPlaying: true)
+        }
+        guard let item = player.nowPlayingItem else { return nil }
+        let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let artist = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return PlaybackSnapshot(
+            trackKey: "\(item.persistentID)|\(item.playbackStoreID)|\(title)|\(artist)",
+            title: title.isEmpty ? "Unknown Track" : title,
+            artist: artist,
+            album: item.albumTitle ?? "",
+            duration: item.playbackDuration,
+            time: player.currentPlaybackTime.isFinite ? player.currentPlaybackTime : 0,
+            isPlaying: player.playbackState == .playing
         )
-        
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handlePlaybackStateChange),
-            name: .MPMusicPlayerControllerPlaybackStateDidChange,
-            object: musicPlayer
-        )
-        
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleDidEnterBackground),
-            name: UIApplication.didEnterBackgroundNotification,
-            object: nil
-        )
-        
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleDidBecomeActive),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
     }
-    
-    @objc private func handleDidEnterBackground() {
-        guard !isDemoMode else { return }
-        SilentAudioPlayer.shared.start()
-        if pollingTimer == nil {
-            startPolling()
-        }
-        print("[LyricsTracker] App entered background - silent keep-alive active.")
+
+    // MARK: - Lyrics Loading
+
+    private func resetTrack() {
+        fetchTask?.cancel()
+        trackKey = nil
+        title = ""
+        artist = ""
+        lines = []
+        lyricsState = .none
     }
-    
-    @objc private func handleDidBecomeActive() {
-        guard !isDemoMode else { return }
-        SilentAudioPlayer.shared.start()
-        updateNowPlayingItem()
-    }
-    
-    @objc private func handleNowPlayingChange() {
-        guard !isDemoMode else { return }
-        Task { @MainActor in
-            print("[LyricsTracker] Track changed via system notification.")
-            self.updateNowPlayingItem()
-        }
-    }
-    
-    @objc private func handlePlaybackStateChange() {
-        guard !isDemoMode else { return }
-        Task { @MainActor in
-            self.isPlaying = (self.musicPlayer.playbackState == .playing)
-            if self.isPlaying {
-                if self.pollingTimer == nil {
-                    self.startPolling()
-                }
-            }
-            // Trigger immediate sync on pause/play
-            self.syncCurrentTime(playbackTime: self.musicPlayer.currentPlaybackTime)
-        }
-    }
-    
-    // MARK: - Track Processing & LRCLIB Integration
-    
-    private func updateNowPlayingItem() {
-        guard let item = musicPlayer.nowPlayingItem else {
-            currentTitle = "No Track Playing"
-            currentArtist = "Open Apple Music to play"
-            currentAlbum = ""
-            trackDuration = 0.0
-            parsedLines = []
-            currentLine = ""
-            nextLine = nil
-            isSyncedAvailable = false
-            statusMessage = "Waiting for music playback..."
-            Task { await endCurrentActivity() }
+
+    private func load(_ snapshot: PlaybackSnapshot) {
+        resetTrack()
+        trackKey = snapshot.trackKey
+        title = snapshot.title
+        artist = snapshot.artist
+
+        if isDemoMode {
+            lines = LRCParser.parse(DemoLyrics.lrc)
+            lyricsState = .synced
             return
         }
-        
-        let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown Track"
-        let artist = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown Artist"
-        let album = item.albumTitle ?? ""
-        let duration = item.playbackDuration
-        
-        // Check if track actually changed
-        if title == currentTitle && artist == currentArtist && !parsedLines.isEmpty {
-            return
-        }
-        
-        currentTitle = title
-        currentArtist = artist
-        currentAlbum = album
-        trackDuration = duration
-        isPlaying = (musicPlayer.playbackState == .playing)
-        
-        // Reset state for new song
-        parsedLines = []
-        currentLine = "Loading lyrics..."
-        nextLine = nil
-        isSyncedAvailable = false
-        statusMessage = "Fetching from LRCLIB..."
-        
-        fetchLyrics(title: title, artist: artist, album: album, duration: duration)
-    }
-    
-    /// Fetches lyrics with cancellation and in-memory cache to prevent duplicate requests
-    private func fetchLyrics(title: String, artist: String, album: String, duration: Double) {
-        currentFetchTask?.cancel()
-        
-        let cacheKey = "\(title.lowercased())__\(artist.lowercased())"
-        if let cached = lyricsCache[cacheKey] {
-            processLyricsResponse(cached, title: title, artist: artist, duration: duration)
-            return
-        }
-        
-        currentFetchTask = Task { [weak self] in
-            guard let self = self else { return }
-            do {
-                let response = try await self.queryLRCLIB(title: title, artist: artist, album: album, duration: duration)
-                guard !Task.isCancelled else { return }
-                
-                self.lyricsCache[cacheKey] = response
-                self.processLyricsResponse(response, title: title, artist: artist, duration: duration)
-            } catch {
-                guard !Task.isCancelled else { return }
-                print("[LyricsTracker] LRCLIB Fetch Error: \(error.localizedDescription)")
-                self.handleLyricsFailure(reason: "Lyrics unavailable for this track")
-            }
+
+        lyricsState = .loading
+        let key = snapshot.trackKey
+        fetchTask = Task { [lrclib] in
+            let result = await lrclib.lyrics(title: snapshot.title, artist: snapshot.artist,
+                                             album: snapshot.album, duration: snapshot.duration)
+            guard !Task.isCancelled else { return }
+            let tracker = LyricsTracker.shared
+            guard tracker.trackKey == key else { return }
+            tracker.apply(result)
         }
     }
-    
-    /// LRCLIB Free REST API: queries /api/get first, falls back to /api/search
-    private func queryLRCLIB(title: String, artist: String, album: String, duration: Double) async throws -> LRCLibResponse {
-        var components = URLComponents(string: "https://lrclib.net/api/get")!
-        components.queryItems = [
-            URLQueryItem(name: "track_name", value: title),
-            URLQueryItem(name: "artist_name", value: artist),
-            URLQueryItem(name: "duration", value: String(Int(duration)))
-        ]
-        if !album.isEmpty {
-            components.queryItems?.append(URLQueryItem(name: "album_name", value: album))
+
+    private func apply(_ result: LRCLibClient.Result) {
+        switch result {
+        case .synced(let parsed):
+            lines = parsed
+            lyricsState = .synced
+        case .unsynced:
+            lyricsState = .unsynced
+        case .instrumental:
+            lyricsState = .instrumental
+        case .notFound:
+            lyricsState = .notFound
         }
-        
-        guard let url = components.url else {
-            throw URLError(.badURL)
-        }
-        
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 8.0
-        request.setValue("CarPlayLyrics-FreeApp/1.0", forHTTPHeaderField: "User-Agent")
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-            let decoder = JSONDecoder()
-            return try decoder.decode(LRCLibResponse.self, from: data)
-        }
-        
-        // Fallback to search endpoint if exact match not found
-        var searchComponents = URLComponents(string: "https://lrclib.net/api/search")!
-        searchComponents.queryItems = [
-            URLQueryItem(name: "q", value: "\(title) \(artist)")
-        ]
-        
-        guard let searchUrl = searchComponents.url else {
-            throw URLError(.badURL)
-        }
-        
-        var searchRequest = URLRequest(url: searchUrl)
-        searchRequest.timeoutInterval = 8.0
-        searchRequest.setValue("CarPlayLyrics-FreeApp/1.0", forHTTPHeaderField: "User-Agent")
-        
-        let (searchData, searchResponse) = try await URLSession.shared.data(for: searchRequest)
-        if let searchHttp = searchResponse as? HTTPURLResponse, searchHttp.statusCode == 200 {
-            let decoder = JSONDecoder()
-            let list = try decoder.decode([LRCLibResponse].self, from: searchData)
-            // Look for first item with syncedLyrics
-            if let matched = list.first(where: { $0.syncedLyrics != nil && !($0.syncedLyrics?.isEmpty ?? true) }) ?? list.first {
-                return matched
-            }
-        }
-        
-        throw URLError(.resourceUnavailable)
+        tick()
     }
-    
-    private func processLyricsResponse(_ response: LRCLibResponse, title: String, artist: String, duration: Double) {
-        if response.instrumental == true {
-            self.parsedLines = []
-            self.isSyncedAvailable = false
-            self.currentLine = "♫ Instrumental ♫"
-            self.nextLine = nil
-            self.statusMessage = "Instrumental Track"
-            self.startOrUpdateActivity(title: title, artist: artist, duration: duration)
-            return
+
+    // MARK: - Card Content
+
+    private func makeCard(at playbackTime: TimeInterval) -> LyricsAttributes.ContentState {
+        let songLine = artist.isEmpty ? title : "\(title) · \(artist)"
+        func status(_ message: String) -> LyricsAttributes.ContentState {
+            LyricsAttributes.ContentState(kind: .status, currentLine: message, nextLine: songLine,
+                                          songTitle: title, artistName: artist)
         }
-        
-        if let synced = response.syncedLyrics, !synced.isEmpty {
-            let parsed = parseLRC(synced)
-            if !parsed.isEmpty {
-                self.parsedLines = parsed
-                self.isSyncedAvailable = true
-                self.statusMessage = nil
-                self.startOrUpdateActivity(title: title, artist: artist, duration: duration)
-                self.syncCurrentTime(playbackTime: self.musicPlayer.currentPlaybackTime)
-                return
-            }
+
+        switch lyricsState {
+        case .none: return .waiting
+        case .loading: return status("Loading lyrics…")
+        case .notFound: return status("No synced lyrics for this song")
+        case .unsynced: return status("Only unsynced lyrics exist")
+        case .instrumental: return status("♪ Instrumental ♪")
+        case .synced: break
         }
-        
-        // Fallback if only plain lyrics exist
-        if let plain = response.plainLyrics, !plain.isEmpty {
-            self.parsedLines = []
-            self.isSyncedAvailable = false
-            self.currentLine = "Lyrics available on phone"
-            self.nextLine = nil
-            self.statusMessage = "Unsynchronized lyrics only"
-            self.startOrUpdateActivity(title: title, artist: artist, duration: duration)
-            return
-        }
-        
-        handleLyricsFailure(reason: "No lyrics found on LRCLIB")
-    }
-    
-    private func handleLyricsFailure(reason: String) {
-        self.parsedLines = []
-        self.isSyncedAvailable = false
-        self.currentLine = "Lyrics unavailable"
-        self.nextLine = nil
-        self.statusMessage = reason
-        self.startOrUpdateActivity(title: currentTitle, artist: currentArtist, duration: trackDuration)
-    }
-    
-    // MARK: - LRC Parser
-    
-    /// Parses LRC content strings with formats [mm:ss.xx] or [mm:ss.xxx]
-    public func parseLRC(_ lrcString: String) -> [LyricLine] {
-        var result: [LyricLine] = []
-        let lines = lrcString.components(separatedBy: .newlines)
-        
-        // Regex to capture [mm:ss.xx] or [mm:ss.xxx]
-        let pattern = #"\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-            return []
-        }
-        
-        for rawLine in lines {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { continue }
-            
-            let range = NSRange(location: 0, length: trimmed.utf16.count)
-            if let match = regex.firstMatch(in: trimmed, options: [], range: range) {
-                if let minRange = Range(match.range(at: 1), in: trimmed),
-                   let secRange = Range(match.range(at: 2), in: trimmed),
-                   let msRange = Range(match.range(at: 3), in: trimmed),
-                   let textRange = Range(match.range(at: 4), in: trimmed) {
-                    
-                    let minutes = Double(trimmed[minRange]) ?? 0
-                    let seconds = Double(trimmed[secRange]) ?? 0
-                    let msRaw = String(trimmed[msRange])
-                    let msDivisor = pow(10.0, Double(msRaw.count))
-                    let milliseconds = (Double(msRaw) ?? 0) / msDivisor
-                    
-                    let totalSeconds = (minutes * 60.0) + seconds + milliseconds
-                    let text = String(trimmed[textRange]).trimmingCharacters(in: .whitespaces)
-                    
-                    // Keep empty lines as spacers/instrumental pauses if needed, but filter out pure metadata tags
-                    result.append(LyricLine(timestamp: totalSeconds, text: text.isEmpty ? "•••" : text))
-                }
-            }
-        }
-        
-        return result.sorted { $0.timestamp < $1.timestamp }
-    }
-    
-    private var dispatchTimer: DispatchSourceTimer?
-    
-    // MARK: - Synchronization Engine (Delay Slider Logic & Background Song Detection)
-    
-    private func startPolling() {
-        dispatchTimer?.cancel()
-        dispatchTimer = nil
-        pollingTimer?.invalidate()
-        pollingTimer = nil
-        
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(300), leeway: .milliseconds(50))
-        timer.setEventHandler { [weak self] in
-            guard let self = self, !self.isDemoMode else { return }
-            
-            // CRITICAL: iOS stops delivering MPMusicPlayerControllerNowPlayingItemDidChange in background.
-            // Actively detect song change during background polling:
-            if let item = self.musicPlayer.nowPlayingItem {
-                let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let artist = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !title.isEmpty && (title != self.currentTitle || artist != self.currentArtist) {
-                    print("[LyricsTracker] Background song change detected: '\(title)' by '\(artist)'")
-                    self.updateNowPlayingItem()
-                    return
-                }
-            }
-            
-            self.currentPlaybackTime = self.musicPlayer.currentPlaybackTime
-            self.syncCurrentTime(playbackTime: self.currentPlaybackTime)
-        }
-        timer.resume()
-        self.dispatchTimer = timer
-    }
-    
-    /// Evaluates effective time: (currentPlaybackTime - userDelay) and updates lines
-    public func syncCurrentTime(playbackTime: TimeInterval) {
-        guard isSyncedAvailable, !parsedLines.isEmpty else { return }
-        
-        // Core latency formula: subtract the wireless Bluetooth/CarPlay latency
-        let effectiveTime = max(0.0, playbackTime - userDelay)
-        
-        // Binary search for highest timestamp <= effectiveTime
-        var low = 0
-        var high = parsedLines.count - 1
-        var matchIndex = -1
-        
+
+        let time = max(0, playbackTime - userDelay)
+        // Last line whose timestamp has passed.
+        var low = 0, high = lines.count - 1, index = -1
         while low <= high {
             let mid = (low + high) / 2
-            if parsedLines[mid].timestamp <= effectiveTime {
-                matchIndex = mid
-                low = mid + 1
-            } else {
-                high = mid - 1
-            }
+            if lines[mid].time <= time { index = mid; low = mid + 1 } else { high = mid - 1 }
         }
-        
-        var newLine = ""
-        var newNextLine: String? = nil
-        
-        if matchIndex >= 0 {
-            newLine = parsedLines[matchIndex].text
-            if matchIndex + 1 < parsedLines.count {
-                newNextLine = parsedLines[matchIndex + 1].text
-            }
-        } else if let first = parsedLines.first {
-            // Before the first line
-            newLine = "♫ \(currentTitle)"
-            newNextLine = first.text
-        }
-        
-        if newLine != self.currentLine || newNextLine != self.nextLine {
-            self.currentLine = newLine
-            self.nextLine = newNextLine
-            self.pushActivityUpdate()
-        }
+
+        let current = index >= 0 ? lines[index].text : ""
+        let next = lines[(index + 1)...].first { !$0.text.isEmpty }?.text ?? ""
+        return LyricsAttributes.ContentState(kind: .lyrics, currentLine: current.isEmpty ? "♪" : current,
+                                             nextLine: next, songTitle: title, artistName: artist)
     }
-    
-    // MARK: - ActivityKit Lifecycle Management (Edge-Case Safe)
-    
-    private func startOrUpdateActivity(title: String, artist: String, duration: Double) {
-        guard isLiveActivitySupported else { return }
-        
-        let state = LyricsAttributes.ContentState(
-            currentLine: currentLine,
-            nextLine: nextLine,
-            songTitle: title,
-            artistName: artist,
-            isSynced: isSyncedAvailable,
-            statusMessage: statusMessage,
-            progress: duration > 0 ? (currentPlaybackTime / duration) : 0.0,
-            userDelay: userDelay
-        )
-        
-        Task {
-            if let activity = currentActivity {
-                // Check if current activity belongs to this track
-                if activity.attributes.trackId == "\(title)_\(artist)" {
-                    let content = ActivityContent(state: state, staleDate: nil)
-                    await activity.update(content)
-                    return
-                } else {
-                    // Song changed: end prior activity before launching new one to prevent activity leaks
-                    await endCurrentActivity()
+}
+
+// MARK: - LRC Parser
+
+enum LRCParser {
+    /// Handles `[mm:ss.xx]`, `[mm:ss]`, several timestamps per line, `[offset:±ms]`,
+    /// and strips word-level `<mm:ss.xx>` tags.
+    static func parse(_ lrc: String) -> [LyricLine] {
+        var offset: TimeInterval = 0
+        var result: [LyricLine] = []
+
+        for rawLine in lrc.split(whereSeparator: \.isNewline) {
+            var rest = rawLine.drop { $0 == " " }
+            var times: [TimeInterval] = []
+
+            while rest.first == "[", let close = rest.firstIndex(of: "]") {
+                let tag = rest[rest.index(after: rest.startIndex)..<close]
+                if let time = timestamp(tag) {
+                    times.append(time)
+                } else if tag.lowercased().hasPrefix("offset:") {
+                    offset = (Double(tag.dropFirst(7).trimmingCharacters(in: .whitespaces)) ?? 0) / 1000
                 }
+                rest = rest[rest.index(after: close)...]
             }
-            
-            // Start fresh activity
-            do {
-                let attributes = LyricsAttributes(
-                    trackId: "\(title)_\(artist)",
-                    duration: duration
-                )
-                let initialContent = ActivityContent(state: state, staleDate: nil)
-                let activity = try Activity.request(
-                    attributes: attributes,
-                    content: initialContent,
-                    pushType: nil
-                )
-                self.currentActivity = activity
-                self.isActivityActive = true
-                print("[LyricsTracker] Live Activity started successfully: \(activity.id)")
-            } catch {
-                print("[LyricsTracker] Failed to start Live Activity: \(error.localizedDescription)")
+            guard !times.isEmpty else { continue }
+
+            let text = String(rest)
+                .replacing(/<\d+:\d+(?:[.:]\d+)?>/, with: "")
+                .trimmingCharacters(in: .whitespaces)
+            for time in times {
+                result.append(LyricLine(time: max(0, time - offset), text: text))
             }
         }
+        return result.sorted { $0.time < $1.time }
     }
-    
-    private func pushActivityUpdate() {
-        guard let activity = currentActivity else { return }
-        
-        let state = LyricsAttributes.ContentState(
-            currentLine: currentLine,
-            nextLine: nextLine,
-            songTitle: currentTitle,
-            artistName: currentArtist,
-            isSynced: isSyncedAvailable,
-            statusMessage: statusMessage,
-            progress: trackDuration > 0 ? (currentPlaybackTime / trackDuration) : 0.0,
-            userDelay: userDelay
-        )
-        
-        let content = ActivityContent(state: state, staleDate: nil)
-        Task {
-            await activity.update(content)
-        }
+
+    private static func timestamp(_ tag: Substring) -> TimeInterval? {
+        let parts = tag.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2, let minutes = Double(parts[0]) else { return nil }
+        // Seconds may be "ss", "ss.xx" or "ss:xx".
+        guard let seconds = Double(parts[1].replacingOccurrences(of: ":", with: ".")) else { return nil }
+        return minutes * 60 + seconds
     }
-    
-    public func endCurrentActivity() async {
-        guard let activity = currentActivity else { return }
-        let finalState = LyricsAttributes.ContentState(
-            currentLine: currentLine,
-            nextLine: nil,
-            songTitle: currentTitle,
-            artistName: currentArtist,
-            isSynced: isSyncedAvailable,
-            statusMessage: "Ended",
-            progress: 1.0,
-            userDelay: userDelay
-        )
-        let content = ActivityContent(state: finalState, staleDate: nil)
-        await activity.end(content, dismissalPolicy: .immediate)
-        self.currentActivity = nil
-        self.isActivityActive = false
-        print("[LyricsTracker] Live Activity ended.")
-    }
-    
-    // MARK: - Simulator & Demo Mode
-    
-    /// Enables rich simulation for Xcode Simulator without requiring a physical Apple Music library
-    public func enableDemoMode() {
-        isDemoMode = true
-        pollingTimer?.invalidate()
-        pollingTimer = nil
-        
-        currentTitle = "Bohemian Rhapsody"
-        currentArtist = "Queen"
-        currentAlbum = "A Night at the Opera"
-        trackDuration = 180.0
-        isPlaying = true
-        currentPlaybackTime = 0.0
-        
-        let sampleLRC = """
-        [00:01.00]Is this the real life?
-        [00:04.50]Is this just fantasy?
-        [00:08.20]Caught in a landslide, no escape from reality
-        [00:16.00]Open your eyes, look up to the skies and see
-        [00:24.00]I'm just a poor boy, I need no sympathy
-        [00:30.50]Because I'm easy come, easy go
-        [00:34.00]Little high, little low
-        [00:37.00]Any way the wind blows doesn't really matter to me
-        [00:46.00]Mama, just killed a man
-        [00:52.00]Put a gun against his head, pulled my trigger, now he's dead
-        [01:00.00]Mama, life had just begun
-        """
-        self.parsedLines = parseLRC(sampleLRC)
-        self.isSyncedAvailable = true
-        self.statusMessage = nil
-        self.startOrUpdateActivity(title: currentTitle, artist: currentArtist, duration: trackDuration)
-        
-        demoTimer?.invalidate()
-        demoTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, self.isDemoMode else { return }
-                self.currentPlaybackTime += 0.5
-                if self.currentPlaybackTime > 75.0 {
-                    self.currentPlaybackTime = 0.0
-                }
-                self.syncCurrentTime(playbackTime: self.currentPlaybackTime)
-            }
-        }
-    }
-    
-    public func disableDemoMode() {
-        demoTimer?.invalidate()
-        demoTimer = nil
-        isDemoMode = false
-        startTracking()
-    }
+}
+
+// MARK: - Demo Mode (Simulator testing; original placeholder text, not song lyrics)
+
+enum DemoLyrics {
+    static let duration: TimeInterval = 44
+    static let lrc = """
+    [00:01.00]Demo mode: test lines to check the layout
+    [00:05.00]Short line
+    [00:09.00]यह एक छोटी पंक्ति है
+    [00:13.00]यह एक लंबी परीक्षण पंक्ति है जो कारप्ले स्क्रीन पर पूरी दिखनी चाहिए
+    [00:19.00]
+    [00:22.00]A much longer English test line that has to fit on the card without being cut off
+    [00:28.00]मध्यम लंबाई की एक और पंक्ति
+    [00:32.00]बहुत लंबी पंक्ति: गाड़ी चलाते हुए भी आसानी से पढ़ सकें, इसलिए अक्षर बड़े और साफ़ होने चाहिए
+    [00:39.00]Last line, then the demo loops
+    """
 }

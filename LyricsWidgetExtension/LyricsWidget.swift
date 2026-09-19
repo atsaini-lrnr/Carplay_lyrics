@@ -2,97 +2,64 @@
 //  LyricsWidget.swift
 //  LyricsWidgetExtension
 //
-//  WidgetKit Live Activity interface designed specifically for CarPlay Dashboard:
-//  Zero margins, full 100% width edge-to-edge 2-line vertical stack.
+//  The lyrics Live Activity.
+//  - CarPlay Dashboard: the `.small` family (one full canvas; each lyric is one centered line).
+//  - iPhone Lock Screen: the `.medium` family (same card, bigger).
+//  - iPhone Dynamic Island: icons only in the compact slots (they're one short line tall, too small
+//    for lyrics); long-press expands to the full card.
+//
+//  The card view lives in Shared/LyricsShared.swift so the app can preview it.
 //
 
-import WidgetKit
-import SwiftUI
 import ActivityKit
-import UIKit
+import SwiftUI
+import WidgetKit
 
-public struct LyricsWidget: Widget {
-    public init() {}
-    
-    public var body: some WidgetConfiguration {
+struct LyricsWidget: Widget {
+    var body: some WidgetConfiguration {
         ActivityConfiguration(for: LyricsAttributes.self) { context in
-            // MARK: - 100% Full-Width CarPlay Dashboard & Lock Screen Card
-            CarPlayLyricsCardView(state: context.state)
+            LyricsActivityView(state: context.state, isStale: context.isStale)
                 .activityBackgroundTint(Color(red: 0.08, green: 0.09, blue: 0.12))
-                .activitySystemActionForegroundColor(Color.white)
+                .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             DynamicIsland {
-                DynamicIslandExpandedRegion(.leading) {
-                    Text(context.state.songTitle)
-                        .font(.caption2.bold())
-                        .foregroundColor(.green)
-                        .lineLimit(1)
-                }
-                DynamicIslandExpandedRegion(.trailing) {
-                    Text(context.state.artistName)
-                        .font(.caption2)
-                        .foregroundColor(.gray)
-                        .lineLimit(1)
-                }
                 DynamicIslandExpandedRegion(.bottom) {
-                    CarPlayLyricsCardView(state: context.state)
+                    LyricsCardView(state: context.state, isStale: context.isStale, maxPrimarySize: 20)
+                        .frame(height: 64)
                 }
             } compactLeading: {
-                // Left Column: Entire Current Singing Lyric (Left-aligned, Bold White, up to 2 lines)
-                Text(context.state.currentLine.isEmpty ? "Waiting for lyrics..." : context.state.currentLine)
-                    .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.65)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "music.note")
+                    .foregroundStyle(.white)
             } compactTrailing: {
-                // Right Column: Entire Upcoming Next Lyric (Left-aligned, Dimmed Gray, up to 2 lines)
-                if let next = context.state.nextLine, !next.isEmpty {
-                    Text(next)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Color.white.opacity(0.60))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.65)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                Image(systemName: "quote.bubble.fill")
+                    .foregroundStyle(.white.opacity(0.7))
             } minimal: {
                 Image(systemName: "music.note")
-                    .foregroundColor(.white)
+                    .foregroundStyle(.white)
             }
         }
+        // Opts into CarPlay Dashboard (and Apple Watch Smart Stack) with a full-canvas view.
+        .supplementalActivityFamilies([.small])
     }
 }
 
-// MARK: - CarPlay Dashboard & iPhone Lock Screen Presentation (Full 100% Width)
-struct CarPlayLyricsCardView: View {
+private struct LyricsActivityView: View {
     let state: LyricsAttributes.ContentState
-    
+    let isStale: Bool
+    @Environment(\.activityFamily) private var family
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            // Line 1: Primary Singing Line (Full Width, Bold, Auto-scaling)
-            Text(state.currentLine.isEmpty ? "Waiting for lyrics..." : state.currentLine)
-                .font(.system(size: 14.5, weight: .bold, design: .rounded))
-                .foregroundColor(.white)
-                .lineLimit(2)
-                .minimumScaleFactor(0.65)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            
-            // Line 2: Upcoming Next Line (Distinctly smaller, Subtle, Full Width)
-            if let next = state.nextLine, !next.isEmpty {
-                Text(next)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.white.opacity(0.60))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.65)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+        switch family {
+        case .small:
+            // CarPlay: fill the canvas the system gives us.
+            LyricsCardView(state: state, isStale: isStale, maxPrimarySize: 28)
+                .padding(.horizontal, 6)
+        default:
+            // iPhone Lock Screen: the system sizes this to its content, so give it a fixed height.
+            LyricsCardView(state: state, isStale: isStale, maxPrimarySize: 24)
+                .frame(height: 84)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
         }
-        .padding(.horizontal, 4)
-        .padding(.vertical, 2)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

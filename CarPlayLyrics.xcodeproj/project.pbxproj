@@ -65,6 +65,11 @@
 			path = LyricsWidgetExtension;
 			sourceTree = "<group>";
 		};
+		55A66D20305C4ABB001ADCDC /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -88,6 +93,7 @@
 			children = (
 				55A66CCD305C3B32001ADCDC /* CarPlayLyrics */,
 				55A66D01305C4ABA001ADCDC /* LyricsWidgetExtension */,
+				55A66D20305C4ABB001ADCDC /* Shared */,
 				55A66CFC305C4ABA001ADCDC /* Frameworks */,
 				55A66CCC305C3B32001ADCDC /* Products */,
 			);
@@ -130,6 +136,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				55A66CCD305C3B32001ADCDC /* CarPlayLyrics */,
+				55A66D20305C4ABB001ADCDC /* Shared */,
 			);
 			name = CarPlayLyrics;
 			productName = CarPlayLyrics;
@@ -148,6 +155,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				55A66D01305C4ABA001ADCDC /* LyricsWidgetExtension */,
+				55A66D20305C4ABB001ADCDC /* Shared */,
 			);
 			name = LyricsWidgetExtensionExtension;
 			productName = LyricsWidgetExtensionExtension;
@@ -280,7 +288,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
@@ -338,7 +346,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
@@ -358,11 +366,12 @@
 				DEVELOPMENT_TEAM = TV279PMMV8;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "CarPlayLyrics-Info.plist";
 				INFOPLIST_KEY_NSAppleMusicUsageDescription = "CarPlay Lyrics tracks your currently playing music to display real-time synchronized lyrics.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UIBackgroundModes = audio;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Keeps CarPlay Lyrics running in the background so lyrics keep moving while the phone is locked. Your location is not stored or used.";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -393,11 +402,12 @@
 				DEVELOPMENT_TEAM = TV279PMMV8;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "CarPlayLyrics-Info.plist";
 				INFOPLIST_KEY_NSAppleMusicUsageDescription = "CarPlay Lyrics tracks your currently playing music to display real-time synchronized lyrics.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UIBackgroundModes = audio;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Keeps CarPlay Lyrics running in the background so lyrics keep moving while the phone is locked. Your location is not stored or used.";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";

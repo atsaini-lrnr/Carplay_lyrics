@@ -2,99 +2,111 @@
 //  SilentAudioPlayer.swift
 //  CarPlayLyrics
 //
-//  Synthesizes an in-memory silent audio loop and configures AVAudioSession with .mixWithOthers.
-//  This keeps the app's RunLoop and timers active when the phone screen is locked or asleep,
-//  WITHOUT interrupting or ducking Apple Music / Spotify / CarPlay audio.
+//  Plays an in-memory silent loop (mixed with other audio) so iOS keeps the app running while the
+//  phone is locked. Without it the app is suspended ~30 s after locking and the lyrics freeze.
+//
+//  Phone calls, Siri and route changes stop the loop; this class restarts it afterwards.
+//  Personal-use technique: App Review rejects silent-audio keep-alives.
 //
 
-import Foundation
 import AVFoundation
-import UIKit
+import Foundation
 
-public final class SilentAudioPlayer: NSObject, AVAudioPlayerDelegate {
-    public static let shared = SilentAudioPlayer()
-    
-    private var audioPlayer: AVAudioPlayer?
-    public private(set) var isRunning = false
-    
-    private override init() {
-        super.init()
+@MainActor
+final class SilentAudioPlayer {
+    static let shared = SilentAudioPlayer()
+
+    private var player: AVAudioPlayer?
+    /// Whether the app wants the loop running (independent of whether iOS paused it).
+    private var isWanted = false
+    private var observers: [NSObjectProtocol] = []
+
+    var isPlaying: Bool { player?.isPlaying == true }
+
+    private init() {
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification,
+                                            object: session, queue: .main) { note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            MainActor.assumeIsolated {
+                // Silent audio never needs to wait for permission to resume.
+                if raw == AVAudioSession.InterruptionType.ended.rawValue {
+                    DiagnosticsLog.shared.add("Audio interruption ended (call/Siri)")
+                    SilentAudioPlayer.shared.resumeIfNeeded()
+                } else {
+                    DiagnosticsLog.shared.add("Audio interruption began (call/Siri)")
+                }
+            }
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                                            object: session, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                DiagnosticsLog.shared.add("Audio system reset")
+                SilentAudioPlayer.shared.player = nil
+                SilentAudioPlayer.shared.resumeIfNeeded()
+            }
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
+                                            object: session, queue: .main) { _ in
+            MainActor.assumeIsolated { SilentAudioPlayer.shared.resumeIfNeeded() }
+        })
     }
-    
-    /// Prepares AVAudioSession to allow silent background playback mixed with other music
-    @MainActor
-    public func start() {
-        guard !isRunning else { return }
-        isRunning = true
-        
+
+    func start() {
+        isWanted = true
+        resumeIfNeeded()
+    }
+
+    func stop() {
+        isWanted = false
+        player?.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    /// Restarts the loop if iOS stopped it. Cheap; the tracker calls it on every tick as a watchdog.
+    func resumeIfNeeded() {
+        guard isWanted, player?.isPlaying != true else { return }
         do {
             let session = AVAudioSession.sharedInstance()
-            // Use .playback with .mixWithOthers & Bluetooth options so Apple Music / CarPlay audio stream is uninterrupted
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers, .allowBluetoothA2DP, .allowAirPlay])
-            try session.setActive(true, options: [])
-            
-            if audioPlayer == nil {
-                let silentWavData = generateSilentWavData(durationSeconds: 3)
-                let player = try AVAudioPlayer(data: silentWavData)
-                player.delegate = self
-                player.numberOfLoops = -1 // Infinite background loop
-                player.volume = 0.01 // Audible to system audio graph, but data is zero PCM (true silence)
-                player.prepareToPlay()
-                self.audioPlayer = player
+            // .mixWithOthers: never interrupts or ducks Apple Music / CarPlay audio.
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+
+            if player == nil {
+                let newPlayer = try AVAudioPlayer(data: Self.silentWAV(seconds: 3))
+                newPlayer.numberOfLoops = -1
+                newPlayer.volume = 0.01
+                newPlayer.prepareToPlay()
+                player = newPlayer
             }
-            
-            audioPlayer?.play()
-            print("[SilentAudioPlayer] Background keep-alive loop active on Main Thread.")
+            player?.play()
         } catch {
-            print("[SilentAudioPlayer] Audio session notice: \(error.localizedDescription)")
+            print("[SilentAudioPlayer] Could not start keep-alive: \(error)")
+            DiagnosticsLog.shared.add("Audio keep-alive failed: \(error.localizedDescription)")
         }
     }
-    
-    /// Stops the background keep-alive loop
-    @MainActor
-    public func stop() {
-        guard isRunning else { return }
-        isRunning = false
-        audioPlayer?.stop()
-        audioPlayer = nil
-        do {
-            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            print("[SilentAudioPlayer] Background keep-alive loop stopped.")
-        } catch {
-            print("[SilentAudioPlayer] Deactivate notice: \(error.localizedDescription)")
-        }
-    }
-    
-    // MARK: - In-Memory Silent WAV Generator (Clean 44.1kHz 16-bit Mono PCM)
-    
-    private func generateSilentWavData(durationSeconds: Int = 3) -> Data {
-        let sampleRate: Int32 = 44100
-        let channels: Int16 = 1
-        let bitsPerSample: Int16 = 16
-        let totalSamples = Int(sampleRate) * durationSeconds
-        let subChunk2Size = Int32(totalSamples * Int(channels) * Int(bitsPerSample / 8))
-        let chunkSize = 36 + subChunk2Size
-        let byteRate = sampleRate * Int32(channels) * Int32(bitsPerSample / 8)
-        let blockAlign = channels * (bitsPerSample / 8)
-        
+
+    /// 44.1 kHz, 16-bit mono PCM of pure zeros.
+    private static func silentWAV(seconds: Int) -> Data {
+        let sampleRate: UInt32 = 44_100
+        let dataSize = UInt32(Int(sampleRate) * seconds * 2)
+
         var data = Data()
-        data.append(contentsOf: "RIFF".utf8)
-        data.append(withUnsafeBytes(of: chunkSize.littleEndian) { Data($0) })
-        data.append(contentsOf: "WAVE".utf8)
-        data.append(contentsOf: "fmt ".utf8)
-        let subChunk1Size: Int32 = 16
-        data.append(withUnsafeBytes(of: subChunk1Size.littleEndian) { Data($0) })
-        let audioFormat: Int16 = 1 // PCM
-        data.append(withUnsafeBytes(of: audioFormat.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: channels.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: sampleRate.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
-        data.append(contentsOf: "data".utf8)
-        data.append(withUnsafeBytes(of: subChunk2Size.littleEndian) { Data($0) })
-        let silenceBytes = [UInt8](repeating: 0, count: Int(subChunk2Size))
-        data.append(contentsOf: silenceBytes)
+        func append<T: FixedWidthInteger>(_ value: T) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+
+        data.append(contentsOf: Array("RIFF".utf8)); append(36 + dataSize)
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8)); append(UInt32(16))
+        append(UInt16(1))            // PCM
+        append(UInt16(1))            // mono
+        append(sampleRate)
+        append(sampleRate * 2)       // byte rate
+        append(UInt16(2))            // block align
+        append(UInt16(16))           // bits per sample
+        data.append(contentsOf: Array("data".utf8)); append(dataSize)
+        data.append(Data(count: Int(dataSize)))
         return data
     }
 }
