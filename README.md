@@ -4,6 +4,37 @@ Live, time-synced lyrics for whatever is playing in Apple Music, shown as a Live
 
 This is a personal-use project. It keeps itself alive in the background with a silent audio loop and low-accuracy location updates, which App Review does not accept, so it is meant to be sideloaded with Xcode rather than published.
 
+## Prerequisites
+
+Set these up first; everything after this assumes they are in place.
+
+| Need | Why | How to get it |
+|---|---|---|
+| **A Mac on macOS 26 or newer** | Runs Xcode 27 | The project was built and tested on macOS 26.6. |
+| **Xcode 27** | Builds the app and the widget extension. The deployment target is iOS 26.0. | Install from the Mac App Store or [developer.apple.com/download](https://developer.apple.com/download/all/). Open it once and accept the license and any extra components it offers to install. |
+| **An iPhone on iOS 26 or newer** | The app needs Apple Music, Live Activities and (for the real thing) a CarPlay connection, none of which the Simulator can fully provide. | Turn on Developer Mode on the phone: Settings, Privacy & Security, Developer Mode, then restart. |
+| **Apple ID for signing** | Lets Xcode install the app on your phone. A free Apple ID is enough, but free-team builds expire after 7 days and must be reinstalled. | Xcode, Settings, Accounts, add your Apple ID, then pick it as the team on both targets (see Setup). |
+| **USB cable** | First-time pairing and the CarPlay Simulator both use a wired connection. | Use a data-capable cable, not a charge-only one. |
+| **Apple Music** | The only player the app tracks. | Songs must be playing in the built-in Music app. |
+| **Additional Tools for Xcode 27** | Contains **CarPlay Simulator**, which shows the CarPlay Dashboard on your Mac so you can test without a car. | Download "Additional Tools for Xcode 27" from [developer.apple.com/download/all](https://developer.apple.com/download/all/) (free Apple ID), open the disk image and copy the `Hardware` folder somewhere permanent. CarPlay Simulator is `Hardware/CarPlay Simulator.app`. |
+| **Device Hub** | Xcode 27's app for managing connected devices and simulators. Use it to check that your iPhone is paired and ready. | Already inside Xcode: `Xcode.app/Contents/Developer/Applications/DeviceHub.app`. Open it from Xcode's developer-tools menu or directly from that path. |
+| **Internet access on the phone** | Lyrics are fetched from LRCLIB while you drive. | Wi-Fi or mobile data. |
+
+### Pairing the iPhone
+
+1. Plug the iPhone into the Mac with the cable and tap "Trust This Computer" on the phone.
+2. Open Device Hub (or Xcode, Window, Devices and Simulators) and confirm the iPhone shows as connected and not "unavailable". If it says it is locked or untrusted, unlock the phone and trust the Mac again.
+3. In Xcode, pick the iPhone as the run destination at the top of the window.
+
+### Testing CarPlay without a car
+
+1. Complete the pairing above and install the app on the iPhone (see Setup).
+2. Open `CarPlay Simulator.app` from the Additional Tools download. With the iPhone connected by cable, it appears as a CarPlay head unit and shows the CarPlay screen in a window on the Mac.
+3. On the CarPlay screen, switch to the Dashboard split view. The lyrics card appears there once the card is started in the app and Apple Music is playing.
+4. If CarPlay Simulator does not see the phone, unplug and replug the cable, make sure the phone is unlocked and trusted, and that it is not already connected to a real car or another CarPlay session.
+
+The Xcode Simulator alone (no phone) is still useful for checking the card layout: turn on Demo mode, see "Testing in the Simulator" below. It does not play Apple Music and cannot show the CarPlay Dashboard.
+
 ## What it does
 
 - Follows the song Apple Music is playing (title, artist, album, position) and fetches synced lyrics for it.
@@ -13,12 +44,6 @@ This is a personal-use project. It keeps itself alive in the background with a s
 - Has an audio delay slider to compensate for Bluetooth and wireless CarPlay latency.
 - Shows "Paused, open CarPlayLyrics to resume" if the app stops updating for 10 minutes, and removes the card after a long stretch with no music.
 - Records background stalls and audio interruptions in a diagnostics list inside the app.
-
-## Requirements
-
-- Xcode 26 or newer, iOS 26 or newer on the phone.
-- Apple Music (the Music app) as the player. Other players are not tracked.
-- A free Apple ID is enough for signing. Free-team builds expire after 7 days and must be reinstalled.
 
 ## Setup
 
