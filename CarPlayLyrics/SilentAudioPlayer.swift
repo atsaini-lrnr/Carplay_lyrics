@@ -5,12 +5,15 @@
 //  Plays an in-memory silent loop (mixed with other audio) so iOS keeps the app running while the
 //  phone is locked. Without it the app is suspended ~30 s after locking and the lyrics freeze.
 //
-//  Phone calls, Siri and route changes stop the loop; this class restarts it afterwards.
+//  Phone calls, Siri and route changes stop the loop; this class restarts it afterwards. iOS doesn't
+//  always send "interruption ended", so on "began" it asks for ~30 s of extra run time, during
+//  which the tracker's tick keeps retrying `resumeIfNeeded()`.
 //  Personal-use technique: App Review rejects silent-audio keep-alives.
 //
 
 import AVFoundation
 import Foundation
+import UIKit
 
 @MainActor
 final class SilentAudioPlayer {
@@ -20,6 +23,9 @@ final class SilentAudioPlayer {
     /// Whether the app wants the loop running (independent of whether iOS paused it).
     private var isWanted = false
     private var observers: [NSObjectProtocol] = []
+    private var recoveryTask = UIBackgroundTaskIdentifier.invalid
+    /// Retries fail every tick during a call; log only the first failure until it recovers.
+    private var hasLoggedFailure = false
 
     var isPlaying: Bool { player?.isPlaying == true }
 
@@ -39,6 +45,7 @@ final class SilentAudioPlayer {
                     SilentAudioPlayer.shared.resumeIfNeeded()
                 } else {
                     DiagnosticsLog.shared.add("Audio interruption began (\(reason))")
+                    SilentAudioPlayer.shared.beginRecoveryWindow()
                 }
             }
         })
@@ -63,6 +70,7 @@ final class SilentAudioPlayer {
 
     func stop() {
         isWanted = false
+        endRecoveryWindow()
         player?.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
@@ -84,10 +92,37 @@ final class SilentAudioPlayer {
                 player = newPlayer
             }
             player?.play()
+            if player?.isPlaying == true {
+                if hasLoggedFailure { DiagnosticsLog.shared.add("Audio keep-alive restarted") }
+                hasLoggedFailure = false
+                endRecoveryWindow()
+            }
         } catch {
             print("[SilentAudioPlayer] Could not start keep-alive: \(error)")
-            DiagnosticsLog.shared.add("Audio keep-alive failed: \(error.localizedDescription)")
+            if !hasLoggedFailure {
+                hasLoggedFailure = true
+                DiagnosticsLog.shared.add("Audio keep-alive failed, retrying: \(error.localizedDescription)")
+            }
         }
+    }
+
+    /// Keeps the app running briefly after an interruption so the loop can be restarted even if
+    /// "interruption ended" never arrives. Without it the app would be suspended almost immediately.
+    private func beginRecoveryWindow() {
+        guard recoveryTask == .invalid else { return }
+        // The expiration handler can run off the main thread, so hop rather than assume isolation.
+        recoveryTask = UIApplication.shared.beginBackgroundTask(withName: "RestartSilentAudio") {
+            Task { @MainActor in
+                DiagnosticsLog.shared.add("Audio keep-alive could not restart within 30 s")
+                SilentAudioPlayer.shared.endRecoveryWindow()
+            }
+        }
+    }
+
+    private func endRecoveryWindow() {
+        guard recoveryTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(recoveryTask)
+        recoveryTask = .invalid
     }
 
     private static func describe(_ reasonRaw: UInt?) -> String {

@@ -4,6 +4,10 @@
 <dict>
 	<!-- Keeps the app running while the phone is locked so the lyrics card keeps updating.
 	     Must live in a real Info.plist: Xcode ignores INFOPLIST_KEY_UIBackgroundModes. -->
+	<!-- Lyrics change every few seconds; without this iOS redraws the card far less often. -->
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
+	<true/>
+
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

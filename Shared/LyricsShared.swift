@@ -26,6 +26,9 @@ nonisolated struct LyricsAttributes: ActivityAttributes {
         var nextLine: String
         var songTitle: String
         var artistName: String
+        /// Diagnostic: draw the card with plain Text instead of the measured layout, to test whether
+        /// the measuring layout is too expensive for iOS to redraw while the phone is locked.
+        var plainRender = false
 
         static let waiting = ContentState(
             kind: .status,
@@ -206,6 +209,25 @@ struct LyricsCardView: View {
     var maxPrimarySize: CGFloat = 24
 
     var body: some View {
+        if state.plainRender {
+            let lines = state.displayLines(isStale: isStale)
+            VStack(spacing: 4) {
+                Text(lines.primary)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(.white)
+                Text(lines.secondary)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            measuredBody
+        }
+    }
+
+    private var measuredBody: some View {
         GeometryReader { geo in
             let lines = state.displayLines(isStale: isStale)
             let plan = LyricLayout.cardPlan(primary: lines.primary, secondary: lines.secondary,

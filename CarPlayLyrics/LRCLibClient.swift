@@ -60,6 +60,26 @@ final class LRCLibClient {
         let cleanTitle = Self.cleanTitle(title)
         let mainArtist = Self.mainArtist(artist)
         var plainFallback = false
+        /// Preference order: English letters first, Hindi (Devanagari) second, any other script
+        /// last (written out in English letters). A Hindi or other-script match is kept aside while
+        /// the remaining searches look for a version in English letters.
+        var hindi: String?
+        var otherScript: String?
+
+        /// Returns lyrics to show right away (English letters), or remembers a lesser candidate.
+        func consider(_ track: Track) -> [LyricLine]? {
+            guard track.hasSynced, let synced = track.syncedLyrics else { return nil }
+            switch Self.script(of: synced) {
+            case .latin:
+                let lines = LRCParser.parse(synced)
+                if !lines.isEmpty { return lines }
+            case .devanagari:
+                if hindi == nil { hindi = synced }
+            case .other:
+                if otherScript == nil { otherScript = synced }
+            }
+            return nil
+        }
 
         // 1) Exact match on title + artist + album + length. LRCLIB rejects (400) an empty artist or a
         //    length outside 1–3600 s, so only try it when both are usable.
@@ -70,8 +90,8 @@ final class LRCLibClient {
         let canGetExact = !artist.isEmpty && (1...3600).contains(duration)
         if canGetExact, let track: Track = try await get("get", exact) {
             if track.instrumental == true { return .instrumental }
-            if let lines = Self.parsed(track) { return .synced(lines) }
-            plainFallback = track.hasPlain
+            if let lines = consider(track) { return .synced(lines) }
+            plainFallback = track.hasPlain && Self.isReadable(track.plainLyrics ?? "")
         }
 
         // 2) Searches from most to least specific; each result must match the song's length.
@@ -94,20 +114,58 @@ final class LRCLibClient {
             }.filter {
                 duration <= 0 || abs(($0.duration ?? -1_000) - duration) <= Self.durationTolerance
             }
-            if let match = sameLength.first(where: \.hasSynced), let lines = Self.parsed(match) {
-                return .synced(lines)
+            for track in sameLength where track.hasSynced {
+                if let lines = consider(track) { return .synced(lines) }
             }
             if sameLength.contains(where: { $0.instrumental == true }) { return .instrumental }
-            if sameLength.contains(where: \.hasPlain) { plainFallback = true }
+            if sameLength.contains(where: { $0.hasPlain && Self.isReadable($0.plainLyrics ?? "") }) {
+                plainFallback = true
+            }
         }
 
+        // Nothing in English letters: Hindi next, then another script written in English letters.
+        if let hindi {
+            let lines = LRCParser.parse(hindi)
+            if !lines.isEmpty { return .synced(lines) }
+        }
+        if let otherScript {
+            let lines = LRCParser.parse(Self.inEnglishLetters(otherScript))
+            if !lines.isEmpty { return .synced(lines) }
+        }
         return plainFallback ? .unsynced : .notFound
     }
 
-    private static func parsed(_ track: Track) -> [LyricLine]? {
-        guard track.hasSynced, let synced = track.syncedLyrics else { return nil }
-        let lines = LRCParser.parse(synced)
-        return lines.isEmpty ? nil : lines
+    enum Script { case latin, devanagari, other }
+
+    /// The script most of the letters are written in (at least 80% of them), else `.other`.
+    static func script(of lyrics: String) -> Script {
+        var latin = 0
+        var devanagari = 0
+        var total = 0
+        for scalar in lyrics.unicodeScalars where CharacterSet.letters.contains(scalar) {
+            total += 1
+            switch scalar.value {
+            case 0x0041...0x005A, 0x0061...0x007A, 0x00C0...0x024F: latin += 1
+            case 0x0900...0x097F: devanagari += 1
+            default: break
+            }
+        }
+        guard total > 0 else { return .other }
+        if Double(latin) / Double(total) >= 0.8 { return .latin }
+        if Double(devanagari) / Double(total) >= 0.8 { return .devanagari }
+        return .other
+    }
+
+    /// Rewrites another script (Punjabi/Gurmukhi, Bengali…) in English letters, keeping the timing.
+    static func inEnglishLetters(_ lyrics: String) -> String {
+        let latin = lyrics.applyingTransform(.toLatin, reverse: false) ?? lyrics
+        return latin.applyingTransform(.stripDiacritics, reverse: false) ?? latin
+    }
+
+    /// Lyrics written in English letters or Hindi. LRCLIB stores many Indian songs in other
+    /// scripts (Punjabi/Gurmukhi, Bengali, Tamil, Urdu…), which aren't wanted as plain text.
+    static func isReadable(_ lyrics: String) -> Bool {
+        script(of: lyrics) != .other
     }
 
     /// GET https://lrclib.net/api/<endpoint>. Returns nil on 404 (not found).

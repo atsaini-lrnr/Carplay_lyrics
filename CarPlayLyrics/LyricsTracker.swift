@@ -7,6 +7,7 @@
 //
 
 import ActivityKit
+import AVFoundation
 import Combine
 import Foundation
 import MediaPlayer
@@ -54,9 +55,11 @@ final class LyricsTracker: ObservableObject {
     }
 
     private static let delayKey = "CarPlayLyrics_userDelay"
-    /// With nothing playing for this long, stop everything and remove the card (and its Dynamic
-    /// Island / location icons). Long enough to survive a pause or a short call.
-    private static let idleTimeout: TimeInterval = 3 * 60
+    /// With no song loaded in Apple Music for this long, stop everything and remove the card.
+    private static let emptyTimeout: TimeInterval = 3 * 60
+    /// A song is loaded but paused (red light, phone call, between playlists): wait much longer,
+    /// because the app can't restart itself once stopped.
+    private static let pausedTimeout: TimeInterval = 30 * 60
 
     private let player = MPMusicPlayerController.systemMusicPlayer
     private let activity = LiveActivityController()
@@ -72,12 +75,21 @@ final class LyricsTracker: ObservableObject {
     private var fetchTask: Task<Void, Never>?
     private var notPlayingSince: Date?
     private var demoStart = Date()
+    /// Last position Apple Music actually reported, and when we saw it. While the phone is locked,
+    /// Apple Music stops reporting, so we carry the position forward from here ourselves.
+    private var anchorTime: TimeInterval = 0
+    private var anchorDate = Date()
+    private var lastReportedTime: TimeInterval = -1
+    /// Whether playback was running when we last got a real position from Apple Music.
+    private var wasPlayingAtAnchor = false
     /// Set by the Stop button so returning to the app doesn't silently restart the card.
     private var stoppedByUser = false
     private var lastTickAt: Date?
     /// What was going on at the last tick, for describing freezes.
     private var lastTickContext = ""
     private var lastHeartbeatAt = Date.distantPast
+    /// Launch with -simple to draw the card the cheap way (diagnostic).
+    private var plainRender = false
 
     private init() {
         userDelay = UserDefaults.standard.object(forKey: Self.delayKey) as? Double ?? 0.8
@@ -94,6 +106,7 @@ final class LyricsTracker: ObservableObject {
             MainActor.assumeIsolated { LyricsTracker.shared.start() }
         }
 
+        plainRender = ProcessInfo.processInfo.arguments.contains("-simple")
         if ProcessInfo.processInfo.arguments.contains("-demo") {
             isDemoMode = true
         }
@@ -124,6 +137,8 @@ final class LyricsTracker: ObservableObject {
 
         if !isTracking && !isDemoMode { player.beginGeneratingPlaybackNotifications() }
         SilentAudioPlayer.shared.start()
+        // Also keeps Apple Music reporting live playback position to us while off screen; without
+        // it the position freezes and the lyrics stop.
         LocationKeepAlive.shared.start()
         isTracking = true
         notPlayingSince = nil
@@ -170,7 +185,7 @@ final class LyricsTracker: ObservableObject {
         guard let snapshot = currentSnapshot() else {
             if trackKey != nil { resetTrack() }
             publish(.waiting)
-            handleNotPlaying()
+            handleNotPlaying(hasSong: false)
             return
         }
 
@@ -182,7 +197,7 @@ final class LyricsTracker: ObservableObject {
             notPlayingSince = nil
             scheduleTimer(fast: true)
         } else {
-            handleNotPlaying()
+            handleNotPlaying(hasSong: true)
         }
         guard isTracking else { return }
 
@@ -194,8 +209,15 @@ final class LyricsTracker: ObservableObject {
     private func heartbeat(_ snapshot: PlaybackSnapshot) {
         guard Date().timeIntervalSince(lastHeartbeatAt) >= 5 else { return }
         lastHeartbeatAt = Date()
-        print("[heartbeat] \(Self.appStateDescription) | playing=\(snapshot.isPlaying) "
+        print("[heartbeat] \(Date().formatted(date: .omitted, time: .standard)) \(Self.appStateDescription) | playing=\(snapshot.isPlaying) "
+              + "other=\(AVAudioSession.sharedInstance().isOtherAudioPlaying) "
+              + "hint=\(AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint) "
+              + "state=\(player.playbackState.rawValue) reported=\(String(format: "%.1f", player.currentPlaybackTime)) "
               + "time=\(String(format: "%.1f", snapshot.time)) | \(snapshot.title) | line=\(card.currentLine)")
+    }
+
+    static var isConnectedToCarPlay: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .carAudio }
     }
 
     private static var appStateDescription: String {
@@ -207,24 +229,31 @@ final class LyricsTracker: ObservableObject {
         }
     }
 
-    private func handleNotPlaying() {
+    private func handleNotPlaying(hasSong: Bool) {
         let since = notPlayingSince ?? Date()
         notPlayingSince = since
         scheduleTimer(fast: false)
 
-        if Date().timeIntervalSince(since) > Self.idleTimeout {
+        // While plugged into the car, keep waiting however long the music is paused: the app can't
+        // restart itself from the background, so stopping mid-drive would lose the lyrics.
+        guard !Self.isConnectedToCarPlay else { return }
+
+        let timeout = hasSong ? Self.pausedTimeout : Self.emptyTimeout
+        if Date().timeIntervalSince(since) > timeout {
             // Not a user Stop: opening the app again starts a fresh card automatically.
             pauseTracking()
             Task { await activity.end() }
-            DiagnosticsLog.shared.add("No music for \(Int(Self.idleTimeout / 60)) min: stopped and removed the card")
+            DiagnosticsLog.shared.add("\(hasSong ? "Music paused" : "No music") for \(Int(timeout / 60)) min: "
+                                      + "stopped and removed the card")
         }
     }
 
     /// Ticks run at least every second while tracking; a longer gap means iOS suspended the app.
     private func recordStallIfAny() {
         let now = Date()
-        let context = "\(Self.appStateDescription), audio keep-alive \(SilentAudioPlayer.shared.isPlaying ? "on" : "OFF"), "
-            + "location keep-alive \(LocationKeepAlive.shared.isRunning ? "on" : "OFF")"
+        let context = "\(Self.appStateDescription), audio keep-alive \(SilentAudioPlayer.shared.isPlaying ? "on" : "OFF")"
+            + ", location keep-alive \(LocationKeepAlive.shared.isRunning ? "on" : "OFF")"
+            + (Self.isConnectedToCarPlay ? ", CarPlay connected" : "")
         defer {
             lastTickAt = now
             lastTickContext = context
@@ -270,15 +299,52 @@ final class LyricsTracker: ObservableObject {
         guard let item = player.nowPlayingItem else { return nil }
         let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let artist = item.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return PlaybackSnapshot(
-            trackKey: "\(item.persistentID)|\(item.playbackStoreID)|\(title)|\(artist)",
-            title: title.isEmpty ? "Unknown Track" : title,
-            artist: artist,
-            album: item.albumTitle ?? "",
-            duration: item.playbackDuration,
-            time: player.currentPlaybackTime.isFinite ? player.currentPlaybackTime : 0,
-            isPlaying: player.playbackState == .playing
-        )
+        let key = "\(item.persistentID)|\(item.playbackStoreID)|\(title)|\(artist)"
+        let duration = item.playbackDuration
+
+        let appIsOnScreen = UIApplication.shared.applicationState == .active
+        let reported = player.currentPlaybackTime.isFinite ? player.currentPlaybackTime : 0
+        let isNewTrack = key != trackKey
+        let reportedIsFresh = reported != lastReportedTime || isNewTrack
+        if reportedIsFresh {
+            // On screen, Apple Music's state is live: trust it. Off screen it claims "paused" even
+            // while playing, so the state can't be used there. The very first tick after locking
+            // usually brings one last fresh position together with that false "paused"; taking it
+            // at face value would switch carry-forward off for the whole time the phone is locked.
+            // Off screen, a position that moved forward (or a new song) proves playback is running;
+            // a position that jumped back (a seek) keeps the previous verdict.
+            let advanced = !isNewTrack && reported > lastReportedTime
+            if appIsOnScreen {
+                wasPlayingAtAnchor = player.playbackState == .playing
+            } else if isNewTrack || advanced {
+                wasPlayingAtAnchor = true
+            }
+            lastReportedTime = reported
+            anchorTime = reported
+            anchorDate = Date()
+        }
+
+        // Off screen, Apple Music freezes the position it reports and claims "paused", so the
+        // lyrics would stop. (Its audio session flags are no help: both read false while it plays.)
+        // Carry the position forward ourselves from the last real reading instead. In the
+        // foreground its reports are live, so trust them there.
+        var time = reported
+        // Off screen the reported state is unreliable (see above), so use our own verdict there.
+        var isPlaying = appIsOnScreen ? player.playbackState == .playing : (reportedIsFresh && wasPlayingAtAnchor)
+
+        if !reportedIsFresh && !appIsOnScreen && wasPlayingAtAnchor {
+            let carried = anchorTime + Date().timeIntervalSince(anchorDate)
+            // Past the end of the track the next song may already be playing, and we can't tell
+            // which; stop and wait for Apple Music to report again.
+            if duration <= 0 || carried <= duration {
+                time = carried
+                isPlaying = true
+            }
+        }
+
+        return PlaybackSnapshot(trackKey: key, title: title.isEmpty ? "Unknown Track" : title,
+                                artist: artist, album: item.albumTitle ?? "", duration: duration,
+                                time: time, isPlaying: isPlaying)
     }
 
     // MARK: - Lyrics Loading
@@ -337,7 +403,7 @@ final class LyricsTracker: ObservableObject {
         let songLine = artist.isEmpty ? title : "\(title) · \(artist)"
         func status(_ message: String) -> LyricsAttributes.ContentState {
             LyricsAttributes.ContentState(kind: .status, currentLine: message, nextLine: songLine,
-                                          songTitle: title, artistName: artist)
+                                          songTitle: title, artistName: artist, plainRender: plainRender)
         }
 
         switch lyricsState {
@@ -359,8 +425,9 @@ final class LyricsTracker: ObservableObject {
 
         let current = index >= 0 ? lines[index].text : ""
         let next = lines[(index + 1)...].first { !$0.text.isEmpty }?.text ?? ""
-        return LyricsAttributes.ContentState(kind: .lyrics, currentLine: current.isEmpty ? "♪" : current,
-                                             nextLine: next, songTitle: title, artistName: artist)
+        return LyricsAttributes.ContentState(kind: .lyrics, currentLine: current.isEmpty ? "♪ \(title)" : current,
+                                             nextLine: next, songTitle: title, artistName: artist,
+                                             plainRender: plainRender)
     }
 }
 
